@@ -3,6 +3,7 @@
 
 import copy
 import math
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -197,6 +198,28 @@ class Segment(Detect):
 
         c4 = max(ch[0] // 4, self.nm)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+        
+        # Depth Anything v2の初期化
+        try:
+            import torch
+            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+            self.depth_processor = AutoImageProcessor.from_pretrained("LiheYoung/depth-anything-large-hf")
+            self.depth_model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/depth-anything-large-hf")
+            # モデルをGPUに移動（利用可能な場合）
+            self.depth_model = self.depth_model.to(next(self.parameters()).device)
+            self.depth_model.eval()
+            # 入力画像サイズを設定
+            self.depth_processor.size = {"height": 640, "width": 640}
+            self.depth_processor.do_resize = True
+            self.depth_processor.do_rescale = True
+            self.depth_processor.rescale_factor = 1.0 / 255.0
+            self.depth_processor.do_normalize = True
+            self.depth_processor.image_mean = [0.5, 0.5, 0.5]
+            self.depth_processor.image_std = [0.5, 0.5, 0.5]
+        except ImportError:
+            print("Warning: transformers is not installed. Please install it using: pip install transformers")
+            self.depth_model = None
+            self.depth_processor = None
 
     def forward(self, x):
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
@@ -204,9 +227,76 @@ class Segment(Detect):
         bs = p.shape[0]  # batch size
 
         mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+        
         x = Detect.forward(self, x)
+        
         if self.training:
             return x, mc, p
+        
+        # 推論時は深度情報に基づいて重み付けを行う
+        if not self.training and self.depth_model is not None:
+            # 入力画像のサイズを取得
+            img_size = x[0].shape[2:]
+            
+            # Depth Anything v2で深度推定を実行
+            with torch.no_grad():
+                # 入力画像を前処理
+                # 画像を0-255の範囲に正規化
+                input_img = (x[0] * 255).clamp(0, 255).to(torch.uint8)
+                
+                # バッチ内の各画像を個別に処理
+                depth_maps = []
+                for img in input_img:
+                    # 画像をNumPy配列に変換（CHW形式）
+                    img_np = img.cpu().numpy()
+                    # 形状を確認して適切な変換を行う
+                    if img_np.ndim == 3:  # CHW形式の場合
+                        img_np = np.transpose(img_np, (1, 2, 0))  # HWC形式に変換
+                    elif img_np.ndim == 2:  # 単一チャンネルの場合
+                        img_np = np.stack([img_np] * 3, axis=-1)  # グレースケールを3チャンネルに複製
+                    
+                    # PIL Imageに変換
+                    from PIL import Image
+                    img_pil = Image.fromarray(img_np.astype(np.uint8))
+                    
+                    # 画像サイズを確認
+                    if img_pil.size[0] <= 0 or img_pil.size[1] <= 0:
+                        print(f"Warning: Invalid image size: {img_pil.size}")
+                        continue
+                    
+                    try:
+                        # 深度推定を実行
+                        inputs = self.depth_processor(
+                            images=img_pil,
+                            return_tensors="pt",
+                            do_resize=True,
+                            size={"height": 640, "width": 640}
+                        )
+                        # 入力テンソルをGPUに移動
+                        inputs = {k: v.to(next(self.parameters()).device) for k, v in inputs.items()}
+                        depth_map = self.depth_model(**inputs).predicted_depth
+                        depth_maps.append(depth_map)
+                    except Exception as e:
+                        print(f"Warning: Depth estimation failed: {str(e)}")
+                        continue
+                
+                if not depth_maps:  # 深度マップが生成されなかった場合
+                    return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+                
+                # バッチの深度マップを結合
+                depth_map = torch.stack(depth_maps)
+                
+                # 深度マップを正規化（0-1の範囲に）
+                depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+                # 深度マップを入力画像と同じサイズにリサイズ
+                depth_map = F.interpolate(depth_map, size=img_size, mode='bilinear', align_corners=False)
+            
+            # 深度に基づく重みを計算（手前にあるほど重みが大きくなる）
+            depth_weights = 1.0 - depth_map  # 深度が小さい（手前）ほど重みが大きくなる
+            
+            # マスク係数に深度重みを適用
+            mc = mc * depth_weights.view(bs, 1, -1)
+        
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
 
 

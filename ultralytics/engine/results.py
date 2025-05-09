@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import cv2
 
 from ultralytics.data.augment import LetterBox
 from ultralytics.utils import LOGGER, SimpleClass, ops
@@ -203,6 +204,7 @@ class Results(SimpleClass):
         names (dict): Dictionary mapping class indices to class names.
         path (str): Path to the input image file.
         save_dir (str | None): Directory to save results.
+        depth_map (numpy.ndarray | None): Depth map for segmentation tasks.
 
     Methods:
         update: Updates the Results object with new detection data.
@@ -235,7 +237,7 @@ class Results(SimpleClass):
     """
 
     def __init__(
-        self, orig_img, path, names, boxes=None, masks=None, probs=None, keypoints=None, obb=None, speed=None
+        self, orig_img, path, names, boxes=None, masks=None, probs=None, keypoints=None, obb=None, speed=None, depth_map=None
     ) -> None:
         """
         Initialize the Results class for storing and manipulating inference results.
@@ -250,6 +252,7 @@ class Results(SimpleClass):
             keypoints (torch.Tensor | None): A 2D tensor of keypoint coordinates for each detection.
             obb (torch.Tensor | None): A 2D tensor of oriented bounding box coordinates for each detection.
             speed (Dict | None): A dictionary containing preprocess, inference, and postprocess speeds (ms/image).
+            depth_map (numpy.ndarray | None): Depth map for segmentation tasks.
 
         Examples:
             >>> results = model("path/to/image.jpg")
@@ -276,6 +279,7 @@ class Results(SimpleClass):
         self.path = path
         self.save_dir = None
         self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self.depth_map = depth_map
 
     def __getitem__(self, idx):
         """
@@ -1033,6 +1037,43 @@ class Results(SimpleClass):
         conn.close()
 
         LOGGER.info(f"✅ Detection results successfully written to SQL table '{table_name}' in database '{db_path}'.")
+
+    def save(self, save_dir=None, exist_ok=False):
+        """
+        Save the results to a directory.
+
+        Args:
+            save_dir (str, optional): Directory to save the results. Defaults to None.
+            exist_ok (bool, optional): Whether to overwrite existing files. Defaults to False.
+        """
+        if save_dir is None:
+            save_dir = Path("runs/detect/predict")
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=exist_ok)
+
+        # Save the original image
+        if self.orig_img is not None:
+            cv2.imwrite(str(save_dir / "image.jpg"), self.orig_img)
+
+        # Save the depth map if available
+        if self.depth_map is not None:
+            depth_path = save_dir / "depth_map.jpg"
+            cv2.imwrite(str(depth_path), self.depth_map)
+            LOGGER.info(f"Depth map saved to {depth_path}")
+
+        # Save other results
+        if self.boxes is not None:
+            self.boxes.save(save_dir / "boxes.txt")
+        if self.masks is not None:
+            self.masks.save(save_dir / "masks.txt")
+        if self.probs is not None:
+            self.probs.save(save_dir / "probs.txt")
+        if self.keypoints is not None:
+            self.keypoints.save(save_dir / "keypoints.txt")
+        if self.obb is not None:
+            self.obb.save(save_dir / "obb.txt")
+
+        LOGGER.info(f"Results saved to {save_dir}")
 
 
 class Boxes(BaseTensor):

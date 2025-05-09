@@ -3,7 +3,16 @@
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.detect.predict import DetectionPredictor
 from ultralytics.utils import DEFAULT_CFG, ops
+import torch
+import numpy as np
+from PIL import Image
+import cv2
+import os
+import logging
 
+# ロギングの設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SegmentationPredictor(DetectionPredictor):
     """
@@ -44,60 +53,103 @@ class SegmentationPredictor(DetectionPredictor):
         """
         super().__init__(cfg, overrides, _callbacks)
         self.args.task = "segment"
+        
+        # Depth Anything v2モデルの初期化
+        try:
+            logger.info("Loading Depth Anything v2 model...")
+            self.depth_model = torch.hub.load('LiheYoung/Depth-Anything', 'depth_anything_vitl14', pretrained=True)
+            self.depth_model.eval()
+            if torch.cuda.is_available():
+                self.depth_model = self.depth_model.cuda()
+                logger.info("✅ Depth Anything v2 model loaded successfully on GPU")
+            else:
+                logger.info("✅ Depth Anything v2 model loaded successfully on CPU")
+        except Exception as e:
+            logger.error(f"❌ Failed to load Depth Anything v2 model: {e}")
+            self.depth_model = None
 
     def postprocess(self, preds, img, orig_imgs):
         """
         Apply non-max suppression and process segmentation detections for each image in the input batch.
-
-        Args:
-            preds (tuple): Model predictions, containing bounding boxes, scores, classes, and mask coefficients.
-            img (torch.Tensor): Input image tensor in model format, with shape (B, C, H, W).
-            orig_imgs (list | torch.Tensor | np.ndarray): Original image or batch of images.
-
-        Returns:
-            (list): List of Results objects containing the segmentation predictions for each image in the batch.
-                   Each Results object includes both bounding boxes and segmentation masks.
-
-        Examples:
-            >>> predictor = SegmentationPredictor(overrides=dict(model="yolo11n-seg.pt"))
-            >>> results = predictor.postprocess(preds, img, orig_img)
+        Also performs depth estimation using Depth Anything v2.
         """
         # Extract protos - tuple if PyTorch model or array if exported
         protos = preds[1][-1] if isinstance(preds[1], tuple) else preds[1]
-        return super().postprocess(preds[0], img, orig_imgs, protos=protos)
+        
+        # 深度推定の実行
+        depth_maps = []
+        if self.depth_model is not None:
+            logger.info("Starting depth estimation...")
+            for i, orig_img in enumerate(orig_imgs):
+                try:
+                    if isinstance(orig_img, np.ndarray):
+                        orig_img = Image.fromarray(orig_img)
+                    depth_map = self._estimate_depth(orig_img)
+                    if depth_map is not None:
+                        # 深度マップを可視化
+                        depth_colormap = cv2.applyColorMap(
+                            (depth_map * 255).astype(np.uint8),
+                            cv2.COLORMAP_INFERNO
+                        )
+                        depth_maps.append(depth_colormap)
+                    else:
+                        depth_maps.append(None)
+                    if (i + 1) % 50 == 0:
+                        logger.info(f"Processed {i + 1}/{len(orig_imgs)} images for depth estimation")
+                except Exception as e:
+                    logger.error(f"Error processing image {i}: {e}")
+                    depth_maps.append(None)
+        else:
+            logger.warning("Depth model not available, skipping depth estimation")
+            depth_maps = [None] * len(orig_imgs)
+        
+        # セグメンテーション結果の後処理
+        results = super().postprocess(preds[0], img, orig_imgs, protos=protos)
+        
+        # 深度マップを各結果に追加
+        for result, depth_map in zip(results, depth_maps):
+            result.depth_map = depth_map
+        
+        return results
 
-    def construct_results(self, preds, img, orig_imgs, protos):
+    def _estimate_depth(self, image):
         """
-        Construct a list of result objects from the predictions.
+        Depth Anything v2を使用して深度推定を実行
+        """
+        try:
+            transform = torch.hub.load('LiheYoung/Depth-Anything', 'transform', pretrained=True)
+            image = transform(image).unsqueeze(0)
+            
+            if torch.cuda.is_available():
+                image = image.cuda()
+            
+            with torch.no_grad():
+                depth = self.depth_model(image)
+                depth = torch.nn.functional.interpolate(
+                    depth.unsqueeze(1),
+                    size=image.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                depth = depth.squeeze().cpu().numpy()
+            
+            return depth
+        except Exception as e:
+            logger.error(f"Error in depth estimation: {e}")
+            return None
 
-        Args:
-            preds (List[torch.Tensor]): List of predicted bounding boxes, scores, and masks.
-            img (torch.Tensor): The image after preprocessing.
-            orig_imgs (List[np.ndarray]): List of original images before preprocessing.
-            protos (List[torch.Tensor]): List of prototype masks.
-
-        Returns:
-            (List[Results]): List of result objects containing the original images, image paths, class names,
-                bounding boxes, and masks.
+    def construct_results(self, preds, img, orig_imgs, protos, depth_maps):
+        """
+        Construct a list of result objects from the predictions, including depth maps.
         """
         return [
-            self.construct_result(pred, img, orig_img, img_path, proto)
-            for pred, orig_img, img_path, proto in zip(preds, orig_imgs, self.batch[0], protos)
+            self.construct_result(pred, img, orig_img, img_path, proto, depth_map)
+            for pred, orig_img, img_path, proto, depth_map in zip(preds, orig_imgs, self.batch[0], protos, depth_maps)
         ]
 
-    def construct_result(self, pred, img, orig_img, img_path, proto):
+    def construct_result(self, pred, img, orig_img, img_path, proto, depth_map):
         """
-        Construct a single result object from the prediction.
-
-        Args:
-            pred (np.ndarray): The predicted bounding boxes, scores, and masks.
-            img (torch.Tensor): The image after preprocessing.
-            orig_img (np.ndarray): The original image before preprocessing.
-            img_path (str): The path to the original image.
-            proto (torch.Tensor): The prototype masks.
-
-        Returns:
-            (Results): Result object containing the original image, image path, class names, bounding boxes, and masks.
+        Construct a single result object from the prediction, including depth map.
         """
         if not len(pred):  # save empty boxes
             masks = None
@@ -107,7 +159,16 @@ class SegmentationPredictor(DetectionPredictor):
         else:
             masks = ops.process_mask(proto, pred[:, 6:], pred[:, :4], img.shape[2:], upsample=True)  # HWC
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+        
         if masks is not None:
             keep = masks.sum((-2, -1)) > 0  # only keep predictions with masks
             pred, masks = pred[keep], masks[keep]
-        return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], masks=masks)
+        
+        return Results(
+            orig_img,
+            path=img_path,
+            names=self.model.names,
+            boxes=pred[:, :6],
+            masks=masks,
+            depth_map=depth_map
+        )
