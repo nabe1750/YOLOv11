@@ -126,16 +126,20 @@ for obb_result, seg_result in zip(obb_stream, seg_stream):
         h, w = img.shape[:2]
         valid_pts = select_non_masked_midpoint(midpoints, masks, h, w)
 
-        for i, mp in enumerate(valid_pts):
-            xg, yg = int(mp[0]), int(mp[1])
+        for gp in valid_pts:
+            xg, yg = int(gp[0]), int(gp[1])
             cv2.circle(img, (xg, yg), 6, (0, 255, 0), -1)
-
-            if i < len(midpoints):
-                xb, yb = int(midpoints[i][0]), int(midpoints[i][1])
+            
+            for mp in midpoints:
+                if torch.allclose(gp, mp, atol=1e-3):
+                    continue
+                
+                xb, yb = int(mp[0]), int(mp[1])
+                
                 cv2.arrowedLine(
                     img,
-                    (xg, yg),
-                    (xb, yb),
+                    (xg, yg),      # 選択点 → 
+                    (xb, yb),      # 非選択点
                     (0, 255, 255),
                     2,
                     tipLength=0.3

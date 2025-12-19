@@ -60,16 +60,44 @@ def select_non_masked_midpoint(midpoints, masks, orig_h, orig_w):
 
     return selected
 
+#マスク中心から遠いmidpointを採用
+def select_farther_midpoint_from_mask_center(midpoints, masks, h, w):
+    if masks is None:
+        return midpoints[:1]
+
+    mask = masks.data[0].float().cpu()
+    mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0),
+                         size=(h, w),
+                         mode="nearest").squeeze()
+
+    ys, xs = torch.where(mask > 0.5)
+    cx, cy = xs.float().mean(), ys.float().mean()
+    center = torch.tensor([cx, cy])
+
+    dists = [torch.norm(mp - center).item() for mp in midpoints]
+    return [midpoints[int(np.argmax(dists))]]
+
+
 
 # ============================================================
 #                   推論 + 描画 + 保存
 # ============================================================
+SAVE_MIDPOINT_IMAGE = True
+SAVE_GRASP_IMAGE    = True
 
-input_folder = "../../../data/shiba_data/nanox/seijo/images"
+input_folder = "../../../data/raw/source/image"
+
+obb_model = YOLO("../runs/obb/train16/weights/best.pt")
+seg_model = YOLO("../runs/segment/train21/weights/best.pt")
+
 output_dir = create_increment_dir(parent="../output", base="vector_results")
+mid_dir   = os.path.join(output_dir, "midpoints")
+grasp_dir = os.path.join(output_dir, "grasp")
 
-obb_model = YOLO("../runs/obb/train9/weights/best.pt")
-seg_model = YOLO("../runs/segment/train27/weights/best.pt")
+if SAVE_MIDPOINT_IMAGE:
+    os.makedirs(mid_dir, exist_ok=True)
+if SAVE_GRASP_IMAGE:
+    os.makedirs(grasp_dir, exist_ok=True)
 
 for obb_result, seg_result in zip(
     obb_model.predict(source=input_folder, save=True, stream=True),
@@ -77,7 +105,8 @@ for obb_result, seg_result in zip(
 ):
     img = obb_result.orig_img.copy()
     h, w = img.shape[:2]
-
+    
+    img_midpoints = img.copy()
     # ============================
     # ① セグメンテーションマスクを「青」で重ねる
     # ============================
@@ -104,31 +133,41 @@ for obb_result, seg_result in zip(
         # midpoint（元の2点＝青）
         for mp in midpoints:
             x, y = int(mp[0]), int(mp[1])
+            cv2.circle(img_midpoints, (x, y), 6, (255, 0, 0), -1)
             cv2.circle(img, (x, y), 6, (255, 0, 0), -1)
 
         # マスク外の midpoint（緑）＋矢印
-        valid_pts = select_non_masked_midpoint(midpoints, seg_result.masks, h, w)
-
-        for green_pt in valid_pts:
-            gx, gy = int(green_pt[0]), int(green_pt[1])
-            cv2.circle(img, (gx, gy), 6, (0, 255, 0), -1)
-
-            # --- 近い青 midpoint に向けて矢印を描画 ---
-            dists = [torch.norm(green_pt - blue_pt).item() for blue_pt in midpoints]
-            nearest_blue = midpoints[int(np.argmin(dists))]
-            bx, by = int(nearest_blue[0]), int(nearest_blue[1])
-
-            cv2.arrowedLine(
-                img,
-                (gx, gy), (bx, by),
-                (0, 255, 0),
-                3,
-                tipLength=0.3
-            )
+        grasp_pt  = select_non_masked_midpoint(midpoints, seg_result.masks, h, w)
+        
+        for gp in grasp_pt:
+            xg, yg = int(gp[0]), int(gp[1])
+            cv2.circle(img, (xg, yg), 6, (0, 255, 0), -1)
+            
+            for mp in midpoints:
+                if torch.allclose(gp, mp, atol=1e-3):
+                    continue
+                
+                xb, yb = int(mp[0]), int(mp[1])
+                
+                cv2.arrowedLine(
+                    img,
+                    (xg, yg),      # 選択点 → 
+                    (xb, yb),      # 非選択点
+                    (0, 255, 255),
+                    2,
+                    tipLength=0.3
+                )
 
     # ============================
     # 保存
     # ============================
-    save_path = os.path.join(output_dir, os.path.basename(obb_result.path))
-    cv2.imwrite(save_path, img)
-    print(f"保存しました: {save_path}")
+    save_mid_path = os.path.join(mid_dir, os.path.basename(obb_result.path))
+    save_grasp_path = os.path.join(grasp_dir, os.path.basename(obb_result.path))
+
+    if SAVE_MIDPOINT_IMAGE:
+        cv2.imwrite(save_mid_path, img_midpoints)
+
+    if SAVE_GRASP_IMAGE:
+        cv2.imwrite(save_grasp_path, img)
+
+print(f"Results saved to: {mid_dir, grasp_dir}")
